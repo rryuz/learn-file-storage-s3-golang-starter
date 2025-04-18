@@ -1,9 +1,14 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
+	"strings"
+	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/bootdotdev/learn-file-storage-s3-golang-starter/internal/auth"
 	"github.com/bootdotdev/learn-file-storage-s3-golang-starter/internal/database"
 	"github.com/google/uuid"
@@ -95,6 +100,12 @@ func (cfg *apiConfig) handlerVideoGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	video, err = cfg.dbVideoToSignedVideo(video)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Couldn't sign video", err)
+		return
+	}
+
 	respondWithJSON(w, http.StatusOK, video)
 }
 
@@ -116,5 +127,49 @@ func (cfg *apiConfig) handlerVideosRetrieve(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	respondWithJSON(w, http.StatusOK, videos)
+	signedVideos := make([]database.Video, len(videos))
+	for i, video := range videos {
+		signedVideo, err := cfg.dbVideoToSignedVideo(video)
+		if err != nil {
+			respondWithError(w, http.StatusInternalServerError, "Couldn't sign video", err)
+			return
+		}
+		signedVideos[i] = signedVideo
+	}
+
+	respondWithJSON(w, http.StatusOK, signedVideos)
+}
+
+func generatePresignedURL(s3Client *s3.Client, bucket, key string) (string, error) {
+	presignClient := s3.NewPresignClient(s3Client)
+
+	getObjectInput := &s3.GetObjectInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String(key),
+	}
+
+	req, err := presignClient.PresignGetObject(context.Background(), getObjectInput, s3.WithPresignExpires(time.Minute*15))
+	if err != nil {
+		return "", err
+	}
+
+	return req.URL, nil
+}
+
+func (cfg *apiConfig) dbVideoToSignedVideo(video database.Video) (database.Video, error) {
+	if !strings.Contains(*video.VideoURL, ",") {
+		return video, nil
+	}
+
+	bucket := strings.Split(*video.VideoURL, ",")[0]
+	key := strings.Split(*video.VideoURL, ",")[1]
+
+	signedURL, err := generatePresignedURL(cfg.s3Client, bucket, key)
+	if err != nil {
+		return database.Video{}, err
+	}
+
+	video.VideoURL = &signedURL
+
+	return video, nil
 }
