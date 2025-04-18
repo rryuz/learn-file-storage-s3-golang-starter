@@ -1,15 +1,19 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"mime"
 	"net/http"
 	"os"
+	"os/exec"
 	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -95,16 +99,43 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	fileName := base64.RawURLEncoding.EncodeToString(fileNameRandomBytes)
-	fileFullName := fmt.Sprintf("%s.%s", fileName, fileExtension)
+	aspectRatio, err := getVideoAspectRatio(videoLocalFile.Name())
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Failed to get video aspect ratio", err)
+		return
+	}
+
+	const epsilon = 0.01
+	if math.Abs(aspectRatio-16.0/9.0) < epsilon {
+		fileName = fmt.Sprintf("landscape/%s.%s", fileName, fileExtension)
+	} else if math.Abs(aspectRatio-9.0/16.0) < epsilon {
+		fileName = fmt.Sprintf("portrait/%s.%s", fileName, fileExtension)
+	} else {
+		fileName = fmt.Sprintf("other/%s.%s", fileName, fileExtension)
+	}
+
+	processedVideoFilePath, err := processVideoForFastStart(videoLocalFile.Name())
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Failed to process video", err)
+		return
+	}
+	defer os.Remove(processedVideoFilePath)
+
+	videoLocalFile, err = os.Open(processedVideoFilePath)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Failed to open processed video", err)
+		return
+	}
+	defer videoLocalFile.Close()
 
 	cfg.s3Client.PutObject(context.Background(), &s3.PutObjectInput{
 		Bucket:      aws.String(cfg.s3Bucket),
-		Key:         aws.String(fileFullName),
+		Key:         aws.String(fileName),
 		Body:        videoLocalFile,
 		ContentType: aws.String(mediaType),
 	})
 
-	videoURL := fmt.Sprintf("https://%s.s3.%s.amazonaws.com/%s", cfg.s3Bucket, cfg.s3Region, fileFullName)
+	videoURL := fmt.Sprintf("https://%s.s3.%s.amazonaws.com/%s", cfg.s3Bucket, cfg.s3Region, fileName)
 	video.VideoURL = &videoURL
 
 	err = cfg.db.UpdateVideo(video)
@@ -114,4 +145,43 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 	}
 
 	w.WriteHeader(http.StatusCreated)
+}
+
+func getVideoAspectRatio(filePath string) (float64, error) {
+	cmd := exec.Command("ffprobe", "-v", "error", "-print_format", "json", "-show_streams", filePath)
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	err := cmd.Run()
+	if err != nil {
+		return 0, err
+	}
+
+	var result map[string]interface{}
+	err = json.Unmarshal(stdout.Bytes(), &result)
+	if err != nil {
+		return 0, err
+	}
+
+	videoStream := result["streams"].([]interface{})[0].(map[string]interface{})
+	videoWidth := videoStream["width"].(float64)
+	videoHeight := videoStream["height"].(float64)
+
+	return videoWidth / videoHeight, nil
+}
+
+func processVideoForFastStart(filePath string) (string, error) {
+	outputFilePath := filePath + ".processing"
+
+	cmd := exec.Command("ffmpeg", "-i", filePath, "-c", "copy", "-movflags", "faststart", "-f", "mp4", outputFilePath)
+
+	err := cmd.Run()
+	if err != nil {
+		return "", err
+	}
+
+	return outputFilePath, nil
 }
